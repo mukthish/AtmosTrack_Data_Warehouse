@@ -14,12 +14,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 STATE_FILE = Path(config.INGESTION_STATE_FILE)
+WINDOW_MINUTES = config.AGGREGATION_MINUTES
 
 
-def _floor_to_hour(ts: datetime) -> datetime:
+def _floor_to_window(ts: datetime) -> datetime:
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    ts_utc = ts.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    floored_minute = (ts_utc.minute // WINDOW_MINUTES) * WINDOW_MINUTES
+    return ts_utc.replace(minute=floored_minute)
 
 
 def _read_last_window_end() -> datetime | None:
@@ -32,7 +35,7 @@ def _read_last_window_end() -> datetime | None:
         if not raw_value:
             return None
         parsed = datetime.fromisoformat(raw_value)
-        return _floor_to_hour(parsed)
+        return _floor_to_window(parsed)
     except Exception as e:
         log.warning("Failed to read ingestion state file '%s': %s", STATE_FILE, e)
         return None
@@ -40,7 +43,7 @@ def _read_last_window_end() -> datetime | None:
 
 def _write_last_window_end(window_end: datetime) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"last_window_end": _floor_to_hour(window_end).isoformat()}
+    payload = {"last_window_end": _floor_to_window(window_end).isoformat()}
     STATE_FILE.write_text(json.dumps(payload), encoding="utf-8")
 
 
@@ -68,13 +71,13 @@ def _discover_initial_window_start() -> datetime | None:
 
     if not min_timestamps:
         return None
-    return _floor_to_hour(min(min_timestamps))
+    return _floor_to_window(min(min_timestamps))
 
 def fetch_and_load(bq_loader):
     log.info("Starting scheduled ingestion from TimescaleDB to BigQuery...")
 
     now = datetime.now(timezone.utc)
-    end_time = _floor_to_hour(now)
+    end_time = _floor_to_window(now)
 
     last_window_end = _read_last_window_end()
     if last_window_end is None:
@@ -84,11 +87,16 @@ def fetch_and_load(bq_loader):
             return
     else:
         # Watermark stores the latest ingested bucket timestamp, so start
-        # from the next hour to avoid re-ingesting the same bucket.
-        start_time = last_window_end + timedelta(hours=1)
+        # from the next bucket to avoid re-ingesting the same bucket.
+        start_time = last_window_end + timedelta(minutes=WINDOW_MINUTES)
 
     if start_time >= end_time:
-        log.info("No new complete hourly window yet. last_window_end=%s current_end=%s", start_time, end_time)
+        log.info(
+            "No new complete %d-minute window yet. last_window_end=%s current_end=%s",
+            WINDOW_MINUTES,
+            start_time,
+            end_time,
+        )
         return
     
     log.info("Fetching data for time window: %s to %s", start_time, end_time)
@@ -109,11 +117,11 @@ def fetch_and_load(bq_loader):
             )
             cursor = conn.cursor()
             
-            query = """
+            query = f"""
             SELECT 
                 city,
                 hotspot,
-                time_bucket('1 hour', "timestamp") AS ts,
+                time_bucket('{WINDOW_MINUTES} minutes', "timestamp") AS ts,
 
                 AVG(pm25) AS pm25,
                 AVG(pm10) AS pm10,
@@ -246,8 +254,8 @@ def main():
     # Run once immediately on startup
     fetch_and_load(bq_loader)
     
-    # Run every one hour to push newly completed windows.
-    schedule.every().hour.do(fetch_and_load, bq_loader=bq_loader)
+    # Run every aggregation window to push newly completed buckets.
+    schedule.every(WINDOW_MINUTES).minutes.do(fetch_and_load, bq_loader=bq_loader)
     
     try:
         while True:
